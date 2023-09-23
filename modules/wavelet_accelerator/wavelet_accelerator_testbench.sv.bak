@@ -1,0 +1,375 @@
+`timescale 1ns/1ns
+
+module wavelet_accelerator_testbench;
+
+parameter INPUT_WIDTH           = 32; 
+parameter IBUFF_CELL_COUNT      = 4096;
+parameter OBUFF_CELL_COUNT      = 4096;
+parameter DATA_BUS_WIDTH        = 8;
+parameter ADDR_BUS_WIDTH        = 32;
+parameter BASE_ADDRESS          = 32'h1A100000;
+parameter CONFIG_REG_OFFSET     = 2'b00;
+parameter INPUT_REG_OFFSET      = 2'b01;
+parameter OUTPUT_REG_OFFSET     = 2'b10;
+parameter MAX_FILTER_SIZE       = 32;
+parameter FS_WIDTH              = $clog2(MAX_FILTER_SIZE);
+parameter IBUFF_ADDR_WIDTH      = $clog2(IBUFF_CELL_COUNT);
+parameter OBUFF_ADDR_WIDTH      = $clog2(OBUFF_CELL_COUNT);
+
+parameter INPUTS_PATH           = "../filter_inputs.txt";
+parameter COEFFS_HID_PATH       = "../filter_coeffs_HID.txt";
+parameter COEFFS_LOD_PATH       = "../filter_coeffs_LOD.txt";
+
+parameter FILTER_SIZE           = 32;
+parameter DEC_LEVEL             = 4;
+parameter INPUTS_LEN            = 2'b11;
+
+parameter NUMBER_OF_INPUTS      =
+    (INPUTS_LEN == 2'b00) ? (256) :
+    (INPUTS_LEN == 2'b01) ? (512) :
+    (INPUTS_LEN == 2'b10) ? (1024) :
+    (INPUTS_LEN == 2'b11) ? (2048) : (0);    
+
+
+reg                             clk;
+reg                             rst;
+reg [DATA_BUS_WIDTH-1:0]        cpu_data_in;
+reg [ADDR_BUS_WIDTH-1:0]        cpu_addr_in;
+reg                             cpu_read_en_in;
+reg                             cpu_write_en_in;
+reg [15:0]                      configs;
+reg [4:0]                       filter_size;
+reg [1:0]                       inputs_len;
+reg [1:0]                       dec_level;
+reg [31:0]                      output_data;
+reg [15:0]                      config_read_out;
+integer                         i;
+integer                         delay;
+integer                         fd;
+integer                         output_idx;
+
+wire [DATA_BUS_WIDTH-1:0]       cpu_data_out;
+wire                            cpu_data_ready;
+
+reg [INPUT_WIDTH-1:0]   test_input_data     [0:NUMBER_OF_INPUTS-1];
+reg [INPUT_WIDTH-1:0]   test_coeff_HID_data [0:MAX_FILTER_SIZE-1];
+reg [INPUT_WIDTH-1:0]   test_coeff_LOD_data [0:MAX_FILTER_SIZE-1];
+
+initial $readmemb(INPUTS_PATH,       test_input_data);
+initial $readmemb(COEFFS_HID_PATH,   test_coeff_HID_data);
+initial $readmemb(COEFFS_LOD_PATH,   test_coeff_LOD_data);
+
+wavelet_accelerator #(
+    .INPUT_WIDTH                (INPUT_WIDTH),
+    .IBUFF_CELL_COUNT           (IBUFF_CELL_COUNT),
+    .OBUFF_CELL_COUNT           (OBUFF_CELL_COUNT),
+    .DATA_BUS_WIDTH             (DATA_BUS_WIDTH),
+    .ADDR_BUS_WIDTH             (ADDR_BUS_WIDTH),
+    .BASE_ADDRESS               (BASE_ADDRESS),
+    .CONFIG_REG_OFFSET          (CONFIG_REG_OFFSET),
+    .INPUT_REG_OFFSET           (INPUT_REG_OFFSET),
+    .OUTPUT_REG_OFFSET          (OUTPUT_REG_OFFSET)
+) duv (
+    .clk                        (clk),
+    .rst                        (rst),
+    .cpu_data_in                (cpu_data_in),
+    .cpu_addr_in                (cpu_addr_in),
+    .cpu_read_en_in             (cpu_read_en_in),
+    .cpu_write_en_in            (cpu_write_en_in),
+    .cpu_data_out               (cpu_data_out),
+    .cpu_data_ready             (cpu_data_ready)
+);
+
+always #20 clk = ~clk;
+
+task duv_system_reset;
+    begin
+        @(posedge clk) rst = 1;
+        @(posedge clk) rst = 0;
+    end
+endtask
+
+task duv_put_configs;
+    begin
+        configs = {1'b0, filter_size, 1'b1, dec_level, inputs_len, 3'b0};
+        @(posedge clk) ;
+        cpu_addr_in = {BASE_ADDRESS[31:4], CONFIG_REG_OFFSET, 2'b00};
+        cpu_data_in = configs[7:0];
+        cpu_write_en_in = 1'b1;
+        @(posedge clk) ;
+        cpu_addr_in = {BASE_ADDRESS[31:4], CONFIG_REG_OFFSET, 2'b01};
+        cpu_data_in = configs[15:8];
+        cpu_write_en_in = 1'b1;
+        @(posedge clk) ;
+        cpu_addr_in = 32'bz;
+        cpu_data_in = 8'bz;
+        cpu_write_en_in = 1'b0;
+    end
+endtask
+
+task duv_put_init;
+    begin
+        @(posedge clk) ;
+        cpu_addr_in = {BASE_ADDRESS[31:4], CONFIG_REG_OFFSET, 2'b00};
+        cpu_data_in = {configs[7:2], 1'b1, configs[0]};
+        cpu_write_en_in = 1'b1;
+        @(posedge clk) ;
+        cpu_addr_in = 32'bz;
+        cpu_data_in = 8'bz;
+        cpu_write_en_in = 1'b0;
+    end
+endtask
+
+task duv_put_coeffs;
+    begin
+        @(posedge clk) ;
+        for(i = 0; i < FILTER_SIZE; i = i + 1) begin
+            cpu_addr_in = {BASE_ADDRESS[31:4], INPUT_REG_OFFSET, 2'b00};
+            cpu_data_in = test_coeff_HID_data[i][7:0];
+            cpu_write_en_in = 1'b1;
+            @(posedge clk) ;
+            cpu_addr_in = {BASE_ADDRESS[31:4], INPUT_REG_OFFSET, 2'b01};
+            cpu_data_in = test_coeff_HID_data[i][15:8];
+            cpu_write_en_in = 1'b1;
+            @(posedge clk) ;
+            cpu_addr_in = {BASE_ADDRESS[31:4], INPUT_REG_OFFSET, 2'b10};
+            cpu_data_in = test_coeff_HID_data[i][23:16];
+            cpu_write_en_in = 1'b1;
+            @(posedge clk) ;
+            cpu_addr_in = {BASE_ADDRESS[31:4], INPUT_REG_OFFSET, 2'b11};
+            cpu_data_in = test_coeff_HID_data[i][31:24];
+            cpu_write_en_in = 1'b1;
+
+            @(posedge clk) ;
+            cpu_addr_in = 32'bz;
+            cpu_data_in = 8'bz;
+            cpu_write_en_in = 1'b0;
+
+            for(delay=0;delay<3;delay=delay+1) begin
+                @(posedge clk) ;
+            end
+        end
+
+        for(i = 0; i < FILTER_SIZE; i = i + 1) begin
+            cpu_addr_in = {BASE_ADDRESS[31:4], INPUT_REG_OFFSET, 2'b00};
+            cpu_data_in = test_coeff_LOD_data[i][7:0];
+            cpu_write_en_in = 1'b1;
+            @(posedge clk) ;
+            cpu_addr_in = {BASE_ADDRESS[31:4], INPUT_REG_OFFSET, 2'b01};
+            cpu_data_in = test_coeff_LOD_data[i][15:8];
+            cpu_write_en_in = 1'b1;
+            @(posedge clk) ;
+            cpu_addr_in = {BASE_ADDRESS[31:4], INPUT_REG_OFFSET, 2'b10};
+            cpu_data_in = test_coeff_LOD_data[i][23:16];
+            cpu_write_en_in = 1'b1;
+            @(posedge clk) ;
+            cpu_addr_in = {BASE_ADDRESS[31:4], INPUT_REG_OFFSET, 2'b11};
+            cpu_data_in = test_coeff_LOD_data[i][31:24];
+            cpu_write_en_in = 1'b1;
+            
+            @(posedge clk) ;
+            cpu_addr_in = 32'bz;
+            cpu_data_in = 8'bz;
+            cpu_write_en_in = 1'b0;
+
+            for(delay=0;delay<3;delay=delay+1) begin
+                @(posedge clk) ;
+            end
+        end
+
+        cpu_addr_in = 32'bz;
+        cpu_data_in = 8'bz;
+        cpu_write_en_in = 1'b0;
+    end
+endtask
+
+task duv_put_go;
+    begin
+        @(posedge clk) ;
+        cpu_addr_in = {BASE_ADDRESS[31:4], CONFIG_REG_OFFSET, 2'b00};
+        cpu_data_in = {configs[7:1], 1'b1};
+        cpu_write_en_in = 1'b1;
+        @(posedge clk) ;
+        cpu_addr_in = 32'bz;
+        cpu_data_in = 8'bz;
+        cpu_write_en_in = 1'b0;
+    end
+endtask
+
+task duv_put_signal;
+    begin
+        @(posedge clk) ;
+        for(i = 0; i < NUMBER_OF_INPUTS; i = i + 1) begin
+            cpu_addr_in = {BASE_ADDRESS[31:4], INPUT_REG_OFFSET, 2'b00};
+            cpu_data_in = test_input_data[i][7:0];
+            cpu_write_en_in = 1'b1;
+            @(posedge clk) ;
+            cpu_addr_in = {BASE_ADDRESS[31:4], INPUT_REG_OFFSET, 2'b01};
+            cpu_data_in = test_input_data[i][15:8];
+            cpu_write_en_in = 1'b1;
+            @(posedge clk) ;
+            cpu_addr_in = {BASE_ADDRESS[31:4], INPUT_REG_OFFSET, 2'b10};
+            cpu_data_in = test_input_data[i][23:16];
+            cpu_write_en_in = 1'b1;
+            @(posedge clk) ;
+            cpu_addr_in = {BASE_ADDRESS[31:4], INPUT_REG_OFFSET, 2'b11};
+            cpu_data_in = test_input_data[i][31:24];
+            cpu_write_en_in = 1'b1;
+
+            @(posedge clk) ;
+            cpu_addr_in = 32'bz;
+            cpu_data_in = 8'bz;
+            cpu_write_en_in = 1'b0;
+
+            for(delay=0;delay<4;delay=delay+1) begin
+                @(posedge clk) ;
+            end
+        end
+    end
+endtask
+
+task duv_read_config(output [15:0] config_out);
+    begin
+        duv_read_accelerator(
+            {BASE_ADDRESS[31:4],
+            CONFIG_REG_OFFSET,
+            2'b00}, 2'b01, config_out);
+    end
+endtask
+
+task duv_read_output(output [31:0] output_out);
+    begin
+        duv_read_accelerator(
+            {BASE_ADDRESS[31:4],
+            OUTPUT_REG_OFFSET,
+            2'b00}, 2'b11, output_out);
+    end
+endtask
+
+task duv_wait_init_finish();
+    begin
+        while(1) begin
+            duv_read_config(config_read_out);
+            if(config_read_out[1] == 1'b0)
+                break;
+            for(delay=0;delay<4;delay=delay+1) begin
+                @(posedge clk) ;
+            end
+        end
+    end
+endtask
+
+reg [2:0] le_byte;
+
+task duv_read_accelerator(
+    input [31:0]    addr,
+    input [1:0]     bytes,
+    output [31:0]   read_data
+);
+    begin
+        read_data = 32'bz;
+        @(posedge clk) ;
+        cpu_read_en_in = 1;
+        for(le_byte = 0; le_byte <= {1'b0, bytes}; le_byte = le_byte + 3'b01) begin
+            cpu_addr_in = {addr[31:2], le_byte[1:0]};
+            #1 ;
+            while(~cpu_data_ready) @(posedge clk) #1;
+            #1 read_data =
+                (le_byte == 0) ? ({read_data[31:8], cpu_data_out}) : 
+                (le_byte == 1) ? ({read_data[31:16], cpu_data_out, read_data[7:0]}) :
+                (le_byte == 2) ? ({read_data[31:24], cpu_data_out, read_data[15:0]}) :
+                (le_byte == 3) ? ({cpu_data_out, read_data[23:0]}) : (read_data);
+            @(posedge clk) ;
+        end
+        cpu_read_en_in = 0;
+        cpu_addr_in = 32'bz;
+    end
+endtask
+
+task duv_reset_r_addr();
+    begin
+        @(posedge clk);
+        cpu_addr_in = {BASE_ADDRESS[31:4], CONFIG_REG_OFFSET, 2'b00};
+        cpu_data_in = {5'b0, 1'b1, 2'b0};
+        cpu_write_en_in = 1'b1;
+        @(posedge clk);
+        cpu_addr_in = 32'bz;
+        cpu_data_in = 8'bz;
+        cpu_write_en_in = 1'b0;
+    end
+endtask
+
+task duv_read_outputs();
+    begin
+        output_idx = 0;
+
+        while(1) begin
+            duv_read_config(config_read_out);
+            
+            for(delay=0;delay<4;delay=delay+1) begin
+                @(posedge clk) ;
+            end
+
+            if(config_read_out[7] == 1'b1) begin
+                output_idx = output_idx + 1;
+                
+                duv_read_output(output_data);
+                $fdisplayb(fd, output_data);
+            end
+            else
+                break;
+
+            for(delay=0;delay<4;delay=delay+1) begin
+                @(posedge clk) ;
+            end
+        end
+    end
+endtask
+
+task duv_wait_go_finish();
+    begin
+        while(1) begin
+            duv_read_config(config_read_out);
+            if(~config_read_out[0]) break;
+
+            for(delay=0;delay<4;delay=delay+1) begin
+                @(posedge clk) ;
+            end
+        end
+    end
+endtask
+
+initial begin
+    clk                     = 0;
+    rst                     = 0;
+    cpu_data_in             = {(8){1'bz}};
+    cpu_addr_in             = {(32){1'bz}};
+    cpu_read_en_in          = 0;
+    cpu_write_en_in         = 0;
+    filter_size             = FILTER_SIZE - 1;
+    inputs_len              = INPUTS_LEN;
+    dec_level               = DEC_LEVEL - 1;
+
+    duv_system_reset();
+    duv_put_configs();
+
+    // duv_put_init();
+    // duv_put_coeffs();
+
+    // duv_wait_init_finish();
+
+    // duv_put_go();
+    // duv_reset_r_addr();
+    
+    // duv_put_signal();
+
+    // duv_wait_go_finish();
+
+    // fd = $fopen("../a_outputs.txt", "w");
+    // duv_read_outputs();
+    // $fclose(fd);
+    // repeat(100) @(posedge clk);
+    $stop();
+end
+
+endmodule

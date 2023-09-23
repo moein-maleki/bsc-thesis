@@ -1,0 +1,202 @@
+module wavelet_core_controller #(
+    parameter INPUT_WIDTH           = 32, 
+    parameter IBUFF_CELL_COUNT      = 2048,
+    parameter OBUFF_CELL_COUNT      = 4096,
+    parameter MAX_FILTER_SIZE       = 32,
+
+    parameter FS_WIDTH              = $clog2(MAX_FILTER_SIZE),
+    parameter IBUFF_ADDR_WIDTH      = $clog2(IBUFF_CELL_COUNT),
+    parameter OBUFF_ADDR_WIDTH      = $clog2(OBUFF_CELL_COUNT)
+) (
+    input                       clk,
+    input                       rst,
+
+    // config signals
+    input [FS_WIDTH-1:0]        core_filter_size,
+    input [1:0]                 core_dec_level,
+    input [1:0]                 core_inputs_len,
+    input                       core_downsample,
+    input [1:0]                 cur_dec_level,
+    
+    // config register bits
+    output reg                  clear_core_init,
+    output reg                  clear_core_go,
+    input                       core_go,
+    input                       core_init,
+
+    input                       core_input_reg_en,
+    input                       core_output_reg_en_pulse,
+
+    // pe control
+    output reg                  pe_init,
+    output reg                  pe_go,
+    output                      pe_hurry,
+    input                       pe_job_done,
+    
+    // dec_level control
+    output reg                  cur_dec_level_cen,
+    output reg                  clear_cur_dec_level,
+    input                       last_dec_level,
+    
+    // ibuff signals
+    output reg                  ibuff_w_sel_obuff_r_data,
+    output reg                  ibuff_w_sel_input_reg,
+    output reg                  ibuff_w_en,
+    output reg                  ibuff_w_offset_cen,
+    output reg                  ibuff_w_offset_rst,
+    output reg                  ibuff_w_base_reg_rst,
+    output reg                  ibuff_w_sel_erase,
+    input [IBUFF_ADDR_WIDTH-1:0] ibuff_w_offset,
+    input [IBUFF_ADDR_WIDTH-1:0] cur_abs_inputs_len,
+
+    // obuff signals
+    output reg                  obuff_r_en,
+    output reg                  obuff_r_offset_rst,
+    output reg                  obuff_r_offset_cen,
+    output reg                  obuff_r_base_reg_rst,
+    output reg                  core_r_addr_rst_cu,
+    input                       obuff_r_last_input
+);
+
+typedef enum {
+    IDLE,
+    WAIT_TO_COME,
+    WAIT_TO_END,
+    IBUFF_WRITE,
+    WRITE_BACK,
+    CLEAR_UP_IBUFF,
+    RESET_STATUS,
+    DECIDE_GO,
+    WORK
+    } state;
+
+state present_state;
+state next_state;
+
+wire ibuff_w_zombie;
+wire last_coeff;
+wire ibuff_last_w_offset_cen;
+wire pe_go_first_chance;
+
+assign pe_go_first_chance       = (ibuff_w_offset == 2);
+assign last_coeff               = (ibuff_w_offset == ((core_filter_size << 1) + 1));
+assign ibuff_last_w_offset_cen  = (ibuff_w_offset == (cur_abs_inputs_len + core_filter_size));
+assign ibuff_w_zombie           = (core_init) ? (1'b0) : (ibuff_w_offset >= cur_abs_inputs_len);
+assign pe_hurry                 = 
+    (
+        (present_state == WORK) |
+        (core_go & (present_state == IBUFF_WRITE))
+    ) & (ibuff_w_offset == (cur_abs_inputs_len + core_filter_size));
+
+always @(posedge clk) begin
+    if(rst)         present_state <= IDLE;
+    else            present_state <= next_state;
+end
+
+always@(present_state, core_init, core_go, core_input_reg_en, core_output_reg_en_pulse,
+    pe_job_done, ibuff_w_zombie, last_coeff, last_dec_level, ibuff_last_w_offset_cen) begin
+    
+    next_state <= IDLE;
+    case (present_state)
+        IDLE:               next_state <= (core_init | core_go) ? (WAIT_TO_COME) : (IDLE);
+        WAIT_TO_COME:       next_state <=
+            (pe_job_done)           ? (
+                (core_init) ? (CLEAR_UP_IBUFF)  :
+                (core_go)   ? (DECIDE_GO)       : (RESET_STATUS)
+            ) :
+            (ibuff_w_zombie)        ? (IBUFF_WRITE) :
+            (core_input_reg_en)     ? (WAIT_TO_END) : (WAIT_TO_COME);        
+        WAIT_TO_END:        next_state <= (~core_input_reg_en) ? (IBUFF_WRITE) : (WAIT_TO_END);
+        IBUFF_WRITE:          next_state <= (WAIT_TO_COME);
+        DECIDE_GO:          next_state <= (last_dec_level) ? (RESET_STATUS) : (WRITE_BACK);
+        WRITE_BACK:         next_state <= (ibuff_last_w_offset_cen & (~core_output_reg_en_pulse)) ? (WORK) : (WRITE_BACK);
+        WORK:               next_state <= (pe_job_done) ? (DECIDE_GO) : (WORK);
+        CLEAR_UP_IBUFF:     next_state <= (last_coeff) ? (RESET_STATUS) : (CLEAR_UP_IBUFF);
+        RESET_STATUS:       next_state <= IDLE;
+    endcase
+end
+
+always @(present_state, core_init, core_go, ibuff_w_zombie,
+    ibuff_last_w_offset_cen, core_output_reg_en_pulse, pe_go_first_chance) begin
+    {
+        pe_init,
+        pe_go,
+        cur_dec_level_cen,
+        clear_cur_dec_level,
+        ibuff_w_sel_obuff_r_data,
+        ibuff_w_sel_input_reg,
+        ibuff_w_en,
+        ibuff_w_offset_cen,
+        ibuff_w_offset_rst,
+        ibuff_w_base_reg_rst,
+        obuff_r_en,
+        obuff_r_offset_rst,
+        obuff_r_offset_cen,
+        obuff_r_base_reg_rst,
+        clear_core_init,
+        clear_core_go,
+        ibuff_w_sel_erase,
+        core_r_addr_rst_cu
+    } <= 0;
+    case (present_state)
+        IDLE:               begin
+            ibuff_w_base_reg_rst        <= (core_init | core_go);
+            ibuff_w_offset_rst          <= (core_init | core_go);
+            obuff_r_base_reg_rst        <= (core_go);
+            obuff_r_offset_rst          <= (core_go);
+            pe_init                     <= (core_init);
+            pe_go                       <= (core_go);
+            clear_cur_dec_level         <= (core_go);
+            core_r_addr_rst_cu          <= (core_go);
+        end    
+        WAIT_TO_COME:       begin
+            ;
+        end      
+        WAIT_TO_END:        begin
+            ;
+        end 
+        IBUFF_WRITE:          begin
+            ibuff_w_sel_input_reg       <= (core_init | (core_go & (cur_dec_level == 2'b00)));
+            ibuff_w_en                  <= (core_init | core_go) & (~ibuff_w_zombie);
+            ibuff_w_offset_cen          <= (core_init | core_go);
+        end
+        DECIDE_GO:          begin
+            ibuff_w_base_reg_rst        <= 1'b1;
+            ibuff_w_offset_rst          <= 1'b1;
+            obuff_r_offset_rst          <= 1'b1;
+            obuff_r_base_reg_rst        <= 1'b1; 
+            cur_dec_level_cen           <= 1'b1;
+        end
+        WRITE_BACK: begin 
+            obuff_r_en                  <= (~core_output_reg_en_pulse) & (~ibuff_w_zombie);
+            obuff_r_offset_cen          <= (~core_output_reg_en_pulse) & (~ibuff_w_zombie) & (~ibuff_last_w_offset_cen);
+            ibuff_w_sel_obuff_r_data    <= (~ibuff_w_zombie);
+            ibuff_w_sel_erase           <= (ibuff_w_zombie) & (~ibuff_last_w_offset_cen);
+            ibuff_w_en                  <= (~core_output_reg_en_pulse) & (~ibuff_last_w_offset_cen);
+            ibuff_w_offset_cen          <= (~core_output_reg_en_pulse) & (~ibuff_last_w_offset_cen);
+            pe_go                       <= (pe_go_first_chance);
+        end
+        WORK: begin
+            ;
+        end
+        CLEAR_UP_IBUFF:   begin
+            ibuff_w_sel_erase           <= 1'b1;
+            ibuff_w_en                  <= 1'b1;
+            ibuff_w_offset_cen          <= 1'b1;
+        end
+        RESET_STATUS:       begin
+            ibuff_w_base_reg_rst        <= 1'b1;
+            ibuff_w_offset_rst          <= 1'b1;
+            obuff_r_base_reg_rst        <= 1'b1;
+            obuff_r_offset_rst          <= 1'b1;
+            clear_core_init             <= (core_init);
+            clear_core_go               <= (~core_init) & (core_go);            
+        end
+    endcase
+end
+
+
+
+
+
+endmodule
